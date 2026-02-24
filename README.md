@@ -30,10 +30,12 @@ func main() {
 
 	for i := 0; i < 3; i++ {
 		i := i
-		g.Go(func(ctx context.Context) (int, error) {
+		if err := g.Go(func(ctx context.Context) (int, error) {
 			time.Sleep(time.Duration(3-i) * 50 * time.Millisecond)
 			return i, nil
-		})
+		}); err != nil {
+			panic(err)
+		}
 	}
 
 	for {
@@ -53,7 +55,8 @@ func main() {
 ## API
 
 - `New[T any](ctx context.Context, opts ...Option) *Group[T]`
-- `(*Group[T]).Go(fn TaskFunc[T])`
+- `(*Group[T]).Go(fn TaskFunc[T]) error`
+- `(*Group[T]).Close()`
 - `(*Group[T]).Next() (Result[T], bool)`
 - `(*Group[T]).Wait() error`
 - `(*Group[T]).Cancel(err error)`

@@ -18,15 +18,15 @@ func TestGroupNextReturnsCompletionOrder(t *testing.T) {
 	second := make(chan struct{})
 	third := make(chan struct{})
 
-	g.Go(func(context.Context) (int, error) {
+	mustGo(t, g, func(context.Context) (int, error) {
 		<-first
 		return 1, nil
 	})
-	g.Go(func(context.Context) (int, error) {
+	mustGo(t, g, func(context.Context) (int, error) {
 		<-second
 		return 2, nil
 	})
-	g.Go(func(context.Context) (int, error) {
+	mustGo(t, g, func(context.Context) (int, error) {
 		<-third
 		return 3, nil
 	})
@@ -65,11 +65,11 @@ func TestGroupFailFastCancelsRemainingTasks(t *testing.T) {
 	errBoom := errors.New("boom")
 	ready := make(chan struct{})
 
-	g.Go(func(context.Context) (int, error) {
+	mustGo(t, g, func(context.Context) (int, error) {
 		close(ready)
 		return 0, errBoom
 	})
-	g.Go(func(ctx context.Context) (int, error) {
+	mustGo(t, g, func(ctx context.Context) (int, error) {
 		<-ready
 		<-ctx.Done()
 		return 0, ctx.Err()
@@ -96,7 +96,7 @@ func TestGroupPanicToError(t *testing.T) {
 
 	g := New[int](context.Background(), WithPanicToError(true))
 
-	g.Go(func(context.Context) (int, error) {
+	mustGo(t, g, func(context.Context) (int, error) {
 		panic("kaboom")
 	})
 
@@ -125,7 +125,7 @@ func TestGroupMaxConcurrency(t *testing.T) {
 	var maxRunning int32
 
 	for i := 0; i < total; i++ {
-		g.Go(func(context.Context) (int, error) {
+		mustGo(t, g, func(context.Context) (int, error) {
 			curr := atomic.AddInt32(&running, 1)
 			for {
 				prev := atomic.LoadInt32(&maxRunning)
@@ -172,6 +172,30 @@ func TestWithMaxConcurrencyPanicsForNegativeInput(t *testing.T) {
 	_ = WithMaxConcurrency(-1)
 }
 
+func TestGroupGoReturnsErrAfterClose(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background())
+	g.Close()
+
+	err := g.Go(func(context.Context) (int, error) {
+		return 1, nil
+	})
+	if !errors.Is(err, ErrGroupClosed) {
+		t.Fatalf("expected ErrGroupClosed, got %v", err)
+	}
+}
+
+func TestGroupGoReturnsErrForNilTask(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background())
+	err := g.Go(nil)
+	if !errors.Is(err, ErrNilTask) {
+		t.Fatalf("expected ErrNilTask, got %v", err)
+	}
+}
+
 func mustNext[T any](t *testing.T, g *Group[T]) Result[T] {
 	t.Helper()
 
@@ -180,6 +204,13 @@ func mustNext[T any](t *testing.T, g *Group[T]) Result[T] {
 		t.Fatal("expected next result")
 	}
 	return res
+}
+
+func mustGo[T any](t *testing.T, g *Group[T], fn TaskFunc[T]) {
+	t.Helper()
+	if err := g.Go(fn); err != nil {
+		t.Fatalf("unexpected go error: %v", err)
+	}
 }
 
 func containsError(errs []error, target error) bool {
