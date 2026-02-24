@@ -139,7 +139,7 @@ func (g *Group[T]) Go(fn TaskFunc[T]) error {
 		}
 
 		value, taskErr = fn(g.ctx)
-		return nil
+		return
 	})
 
 	return nil
