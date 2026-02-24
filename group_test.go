@@ -30,6 +30,7 @@ func TestGroupNextReturnsCompletionOrder(t *testing.T) {
 		<-third
 		return 3, nil
 	})
+	g.Close()
 
 	close(second)
 	got := mustNext(t, g)
@@ -49,8 +50,12 @@ func TestGroupNextReturnsCompletionOrder(t *testing.T) {
 		t.Fatalf("expected value=1, err=nil, got value=%d err=%v", got.Value, got.Err)
 	}
 
-	if _, ok := g.Next(); ok {
-		t.Fatal("expected empty group")
+	_, ok, err := g.Next(context.Background())
+	if err != nil {
+		t.Fatalf("expected err=nil, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected closed+drained group")
 	}
 
 	if err := g.Wait(); err != nil {
@@ -139,10 +144,14 @@ func TestGroupMaxConcurrency(t *testing.T) {
 			return 1, nil
 		})
 	}
+	g.Close()
 
 	count := 0
 	for {
-		_, ok := g.Next()
+		_, ok, err := g.Next(withTimeout(t, 2*time.Second))
+		if err != nil {
+			t.Fatalf("unexpected next error: %v", err)
+		}
 		if !ok {
 			break
 		}
@@ -196,10 +205,56 @@ func TestGroupGoReturnsErrForNilTask(t *testing.T) {
 	}
 }
 
+func TestNextReturnsContextErrorWhenWaiting(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	_, ok, err := g.Next(ctx)
+	if ok {
+		t.Fatal("expected ok=false on context cancellation")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+}
+
+func TestNextReturnsFalseOnlyAfterCloseAndDrain(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	_, ok, err := g.Next(ctx)
+	if ok {
+		t.Fatal("expected ok=false while waiting")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded before close, got %v", err)
+	}
+
+	g.Close()
+	_, ok, err = g.Next(context.Background())
+	if err != nil {
+		t.Fatalf("expected err=nil after close+drain, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false after close+drain")
+	}
+}
+
 func mustNext[T any](t *testing.T, g *Group[T]) Result[T] {
 	t.Helper()
 
-	res, ok := g.Next()
+	res, ok, err := g.Next(withTimeout(t, 2*time.Second))
+	if err != nil {
+		t.Fatalf("unexpected next error: %v", err)
+	}
 	if !ok {
 		t.Fatal("expected next result")
 	}
@@ -220,4 +275,11 @@ func containsError(errs []error, target error) bool {
 		}
 	}
 	return false
+}
+
+func withTimeout(t *testing.T, d time.Duration) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	t.Cleanup(cancel)
+	return ctx
 }
