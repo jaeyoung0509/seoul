@@ -2,8 +2,11 @@ package seoul
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // TaskFunc is a unit of work managed by Group.
@@ -15,16 +18,25 @@ type Result[T any] struct {
 	Err   error
 }
 
+var (
+	// ErrGroupClosed is returned by Go when submission happens after Close.
+	ErrGroupClosed = errors.New("seoul: group is closed")
+
+	// ErrNilTask is returned by Go when the task callback is nil.
+	ErrNilTask = errors.New("seoul: nil task")
+)
+
 // Group runs tasks and streams completed results with Next.
 type Group[T any] struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	cfg    config
-
-	sem chan struct{}
+	ctx     context.Context
+	baseCtx context.Context
+	cancel  context.CancelCauseFunc
+	eg      *errgroup.Group
+	cfg     config
 
 	mu       sync.Mutex
 	cond     *sync.Cond
+	closed   bool
 	pending  int
 	queue    []Result[T]
 	firstErr error
@@ -45,15 +57,20 @@ func New[T any](ctx context.Context, opts ...Option) *Group[T] {
 		}
 	}
 
-	runCtx, cancel := context.WithCancelCause(ctx)
-	g := &Group[T]{
-		ctx:    runCtx,
-		cancel: cancel,
-		cfg:    cfg,
-		queue:  make([]Result[T], 0, cfg.resultBuffer),
-	}
+	baseCtx, cancel := context.WithCancelCause(ctx)
+	eg, runCtx := errgroup.WithContext(baseCtx)
+
 	if cfg.maxConcurrency > 0 {
-		g.sem = make(chan struct{}, cfg.maxConcurrency)
+		eg.SetLimit(cfg.maxConcurrency)
+	}
+
+	g := &Group[T]{
+		ctx:     runCtx,
+		baseCtx: baseCtx,
+		cancel:  cancel,
+		eg:      eg,
+		cfg:     cfg,
+		queue:   make([]Result[T], 0, cfg.resultBuffer),
 	}
 	g.cond = sync.NewCond(&g.mu)
 	return g
@@ -74,17 +91,58 @@ func (g *Group[T]) Cancel(err error) {
 	})
 }
 
+// Close seals the group and prevents future Go calls.
+func (g *Group[T]) Close() {
+	g.mu.Lock()
+	g.closed = true
+	g.cond.Broadcast()
+	g.mu.Unlock()
+}
+
 // Go starts a task.
-func (g *Group[T]) Go(fn TaskFunc[T]) {
+func (g *Group[T]) Go(fn TaskFunc[T]) error {
 	if fn == nil {
-		panic("seoul: nil task")
+		return ErrNilTask
 	}
 
 	g.mu.Lock()
+	if g.closed {
+		g.mu.Unlock()
+		return ErrGroupClosed
+	}
 	g.pending++
 	g.mu.Unlock()
 
-	go g.run(fn)
+	g.eg.Go(func() (retErr error) {
+		var (
+			value   T
+			taskErr error
+		)
+
+		defer func() {
+			g.finish(Result[T]{Value: value, Err: taskErr})
+
+			if taskErr != nil && g.cfg.failFast {
+				g.cancelOnce.Do(func() {
+					g.cancel(taskErr)
+				})
+				retErr = taskErr
+			}
+		}()
+
+		if g.cfg.panicToError {
+			defer func() {
+				if r := recover(); r != nil {
+					taskErr = fmt.Errorf("seoul: panic recovered: %v", r)
+				}
+			}()
+		}
+
+		value, taskErr = fn(g.ctx)
+		return nil
+	})
+
+	return nil
 }
 
 // Next blocks until one task completes, or returns ok=false if the group is empty.
@@ -107,69 +165,18 @@ func (g *Group[T]) Next() (res Result[T], ok bool) {
 
 // Wait waits for all currently started tasks and returns the first observed error.
 func (g *Group[T]) Wait() error {
+	waitErr := g.eg.Wait()
+
 	g.mu.Lock()
-	for g.pending > 0 {
-		g.cond.Wait()
-	}
 	firstErr := g.firstErr
 	g.mu.Unlock()
-
 	if firstErr != nil {
 		return firstErr
 	}
-	return context.Cause(g.ctx)
-}
-
-func (g *Group[T]) run(fn TaskFunc[T]) {
-	var (
-		value T
-		err   error
-	)
-
-	if !g.acquire() {
-		cancelErr := context.Cause(g.ctx)
-		if cancelErr == nil {
-			cancelErr = context.Canceled
-		}
-		g.finish(Result[T]{Err: cancelErr})
-		return
+	if waitErr != nil {
+		return waitErr
 	}
-	defer g.release()
-
-	if g.cfg.panicToError {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("seoul: panic recovered: %v", r)
-			}
-			g.finish(Result[T]{Value: value, Err: err})
-		}()
-	} else {
-		defer func() {
-			g.finish(Result[T]{Value: value, Err: err})
-		}()
-	}
-
-	value, err = fn(g.ctx)
-}
-
-func (g *Group[T]) acquire() bool {
-	if g.sem == nil {
-		return true
-	}
-
-	select {
-	case g.sem <- struct{}{}:
-		return true
-	case <-g.ctx.Done():
-		return false
-	}
-}
-
-func (g *Group[T]) release() {
-	if g.sem == nil {
-		return
-	}
-	<-g.sem
+	return context.Cause(g.baseCtx)
 }
 
 func (g *Group[T]) finish(res Result[T]) {
