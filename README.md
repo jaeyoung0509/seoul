@@ -68,6 +68,8 @@ func main() {
 
 - `Next(ctx)` blocks until a task finishes, context ends, or group is closed+drained.
 - `Next(ctx)` returns `ok=false, err=nil` only when group is closed and drained.
+- `WithFailFast(true)` cancels group context on first task error.
+- `WithFailFast(false)` keeps remaining tasks running and reports errors through results/`Wait`.
 - `Wait` returns the first observed task error (if any), otherwise context cancellation cause.
 
 ## Status
