@@ -39,7 +39,10 @@ func main() {
 	}
 
 	for {
-		res, ok := g.Next()
+		res, ok, err := g.Next(context.Background())
+		if err != nil {
+			panic(err)
+		}
 		if !ok {
 			break
 		}
@@ -57,14 +60,14 @@ func main() {
 - `New[T any](ctx context.Context, opts ...Option) *Group[T]`
 - `(*Group[T]).Go(fn TaskFunc[T]) error`
 - `(*Group[T]).Close()`
-- `(*Group[T]).Next() (Result[T], bool)`
+- `(*Group[T]).Next(ctx context.Context) (Result[T], bool, error)`
 - `(*Group[T]).Wait() error`
 - `(*Group[T]).Cancel(err error)`
 
 ## Notes
 
-- `Next` blocks until a task finishes.
-- `Next` returns `ok=false` when there are no queued results and no running tasks.
+- `Next(ctx)` blocks until a task finishes, context ends, or group is closed+drained.
+- `Next(ctx)` returns `ok=false, err=nil` only when group is closed and drained.
 - `Wait` returns the first observed task error (if any), otherwise context cancellation cause.
 
 ## Status

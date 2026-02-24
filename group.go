@@ -35,11 +35,11 @@ type Group[T any] struct {
 	cfg     config
 
 	mu       sync.Mutex
-	cond     *sync.Cond
 	closed   bool
 	pending  int
 	queue    []Result[T]
 	firstErr error
+	notify   chan struct{}
 
 	cancelOnce sync.Once
 }
@@ -71,8 +71,8 @@ func New[T any](ctx context.Context, opts ...Option) *Group[T] {
 		eg:      eg,
 		cfg:     cfg,
 		queue:   make([]Result[T], 0, cfg.resultBuffer),
+		notify:  make(chan struct{}),
 	}
-	g.cond = sync.NewCond(&g.mu)
 	return g
 }
 
@@ -94,8 +94,10 @@ func (g *Group[T]) Cancel(err error) {
 // Close seals the group and prevents future Go calls.
 func (g *Group[T]) Close() {
 	g.mu.Lock()
-	g.closed = true
-	g.cond.Broadcast()
+	if !g.closed {
+		g.closed = true
+		g.signalLocked()
+	}
 	g.mu.Unlock()
 }
 
@@ -111,6 +113,7 @@ func (g *Group[T]) Go(fn TaskFunc[T]) error {
 		return ErrGroupClosed
 	}
 	g.pending++
+	g.signalLocked()
 	g.mu.Unlock()
 
 	g.eg.Go(func() (retErr error) {
@@ -123,9 +126,6 @@ func (g *Group[T]) Go(fn TaskFunc[T]) error {
 			g.finish(Result[T]{Value: value, Err: taskErr})
 
 			if taskErr != nil && g.cfg.failFast {
-				g.cancelOnce.Do(func() {
-					g.cancel(taskErr)
-				})
 				retErr = taskErr
 			}
 		}()
@@ -145,21 +145,32 @@ func (g *Group[T]) Go(fn TaskFunc[T]) error {
 	return nil
 }
 
-// Next blocks until one task completes, or returns ok=false if the group is empty.
-func (g *Group[T]) Next() (res Result[T], ok bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+// Next blocks until one task completes, the caller context ends, or the group is closed and drained.
+func (g *Group[T]) Next(ctx context.Context) (res Result[T], ok bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	for {
+		g.mu.Lock()
 		if len(g.queue) > 0 {
 			res = g.queue[0]
 			g.queue = g.queue[1:]
-			return res, true
+			g.mu.Unlock()
+			return res, true, nil
 		}
-		if g.pending == 0 {
-			return Result[T]{}, false
+		if g.closed && g.pending == 0 {
+			g.mu.Unlock()
+			return Result[T]{}, false, nil
 		}
-		g.cond.Wait()
+		notify := g.notify
+		g.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return Result[T]{}, false, ctx.Err()
+		case <-notify:
+		}
 	}
 }
 
@@ -196,5 +207,11 @@ func (g *Group[T]) finish(res Result[T]) {
 
 	g.queue = append(g.queue, res)
 	g.pending--
-	g.cond.Broadcast()
+	g.signalLocked()
+}
+
+func (g *Group[T]) signalLocked() {
+	ch := g.notify
+	g.notify = make(chan struct{})
+	close(ch)
 }
