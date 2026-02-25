@@ -2,8 +2,11 @@ package seoul
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // TaskFunc is a unit of work managed by Group.
@@ -15,19 +18,63 @@ type Result[T any] struct {
 	Err   error
 }
 
+var (
+	// ErrGroupClosed is returned by Go when submission happens after Close.
+	ErrGroupClosed = errors.New("seoul: group is closed")
+
+	// ErrNilTask is returned by Go when the task callback is nil.
+	ErrNilTask = errors.New("seoul: nil task")
+)
+
+type nextReply[T any] struct {
+	res Result[T]
+	ok  bool
+	err error
+}
+
+type taskDoneEvent[T any] struct {
+	res Result[T]
+}
+
+type submitCmd[T any] struct {
+	resp chan error
+}
+
+type closeCmd struct {
+	resp chan struct{}
+}
+
+type nextCmd[T any] struct {
+	resp chan nextReply[T]
+}
+
+type cancelNextCmd[T any] struct {
+	resp chan nextReply[T]
+	err  error
+}
+
+type firstErrCmd struct {
+	resp chan error
+}
+
+type managerState[T any] struct {
+	closed      bool
+	inflight    int
+	results     []Result[T]
+	nextWaiters []chan nextReply[T]
+	firstErr    error
+}
+
 // Group runs tasks and streams completed results with Next.
 type Group[T any] struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	cfg    config
+	ctx     context.Context
+	baseCtx context.Context
+	cancel  context.CancelCauseFunc
+	eg      *errgroup.Group
+	cfg     config
 
-	sem chan struct{}
-
-	mu       sync.Mutex
-	cond     *sync.Cond
-	pending  int
-	queue    []Result[T]
-	firstErr error
+	cmdCh chan any
+	evtCh chan taskDoneEvent[T]
 
 	cancelOnce sync.Once
 }
@@ -45,17 +92,24 @@ func New[T any](ctx context.Context, opts ...Option) *Group[T] {
 		}
 	}
 
-	runCtx, cancel := context.WithCancelCause(ctx)
-	g := &Group[T]{
-		ctx:    runCtx,
-		cancel: cancel,
-		cfg:    cfg,
-		queue:  make([]Result[T], 0, cfg.resultBuffer),
-	}
+	baseCtx, cancel := context.WithCancelCause(ctx)
+	eg, runCtx := errgroup.WithContext(baseCtx)
+
 	if cfg.maxConcurrency > 0 {
-		g.sem = make(chan struct{}, cfg.maxConcurrency)
+		eg.SetLimit(cfg.maxConcurrency)
 	}
-	g.cond = sync.NewCond(&g.mu)
+
+	g := &Group[T]{
+		ctx:     runCtx,
+		baseCtx: baseCtx,
+		cancel:  cancel,
+		eg:      eg,
+		cfg:     cfg,
+		cmdCh:   make(chan any),
+		evtCh:   make(chan taskDoneEvent[T]),
+	}
+	go g.runManager()
+
 	return g
 }
 
@@ -74,120 +128,191 @@ func (g *Group[T]) Cancel(err error) {
 	})
 }
 
-// Go starts a task.
-func (g *Group[T]) Go(fn TaskFunc[T]) {
-	if fn == nil {
-		panic("seoul: nil task")
-	}
-
-	g.mu.Lock()
-	g.pending++
-	g.mu.Unlock()
-
-	go g.run(fn)
+// Close seals the group and prevents future Go calls.
+func (g *Group[T]) Close() {
+	resp := make(chan struct{}, 1)
+	g.cmdCh <- closeCmd{resp: resp}
+	<-resp
 }
 
-// Next blocks until one task completes, or returns ok=false if the group is empty.
-func (g *Group[T]) Next() (res Result[T], ok bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	for {
-		if len(g.queue) > 0 {
-			res = g.queue[0]
-			g.queue = g.queue[1:]
-			return res, true
-		}
-		if g.pending == 0 {
-			return Result[T]{}, false
-		}
-		g.cond.Wait()
+// Go starts a task.
+func (g *Group[T]) Go(fn TaskFunc[T]) error {
+	if fn == nil {
+		return ErrNilTask
 	}
+
+	resp := make(chan error, 1)
+	g.cmdCh <- submitCmd[T]{resp: resp}
+	if err := <-resp; err != nil {
+		return err
+	}
+
+	g.eg.Go(func() (retErr error) {
+		var (
+			value   T
+			taskErr error
+		)
+
+		defer func() {
+			g.evtCh <- taskDoneEvent[T]{res: Result[T]{Value: value, Err: taskErr}}
+
+			if taskErr != nil && g.cfg.failFast {
+				g.cancelOnce.Do(func() {
+					g.cancel(taskErr)
+				})
+				retErr = taskErr
+			}
+		}()
+
+		if g.cfg.panicToError {
+			defer func() {
+				if r := recover(); r != nil {
+					taskErr = fmt.Errorf("seoul: panic recovered: %v", r)
+				}
+			}()
+		}
+
+		value, taskErr = fn(g.ctx)
+		return
+	})
+
+	return nil
+}
+
+// Next blocks until one task completes, the caller context ends, or the group is closed and drained.
+func (g *Group[T]) Next(ctx context.Context) (res Result[T], ok bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	resp := make(chan nextReply[T], 1)
+	g.cmdCh <- nextCmd[T]{resp: resp}
+
+	stopCancelWatcher := make(chan struct{})
+	if done := ctx.Done(); done != nil {
+		go func() {
+			select {
+			case <-done:
+				g.cmdCh <- cancelNextCmd[T]{resp: resp, err: ctx.Err()}
+			case <-stopCancelWatcher:
+			}
+		}()
+	}
+
+	reply := <-resp
+	close(stopCancelWatcher)
+	return reply.res, reply.ok, reply.err
 }
 
 // Wait waits for all currently started tasks and returns the first observed error.
 func (g *Group[T]) Wait() error {
-	g.mu.Lock()
-	for g.pending > 0 {
-		g.cond.Wait()
-	}
-	firstErr := g.firstErr
-	g.mu.Unlock()
+	waitErr := g.eg.Wait()
+	firstErr := g.getFirstErr()
 
 	if firstErr != nil {
 		return firstErr
 	}
-	return context.Cause(g.ctx)
+	if waitErr != nil {
+		return waitErr
+	}
+	return context.Cause(g.baseCtx)
 }
 
-func (g *Group[T]) run(fn TaskFunc[T]) {
-	var (
-		value T
-		err   error
-	)
+func (g *Group[T]) getFirstErr() error {
+	resp := make(chan error, 1)
+	g.cmdCh <- firstErrCmd{resp: resp}
+	return <-resp
+}
 
-	if !g.acquire() {
-		cancelErr := context.Cause(g.ctx)
-		if cancelErr == nil {
-			cancelErr = context.Canceled
-		}
-		g.finish(Result[T]{Err: cancelErr})
-		return
+func (g *Group[T]) runManager() {
+	state := managerState[T]{
+		results:     make([]Result[T], 0, g.cfg.resultBuffer),
+		nextWaiters: make([]chan nextReply[T], 0),
 	}
-	defer g.release()
 
-	if g.cfg.panicToError {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("seoul: panic recovered: %v", r)
+	for {
+		select {
+		case raw := <-g.cmdCh:
+			switch cmd := raw.(type) {
+			case submitCmd[T]:
+				if state.closed {
+					cmd.resp <- ErrGroupClosed
+					continue
+				}
+				state.inflight++
+				cmd.resp <- nil
+
+			case closeCmd:
+				state.closed = true
+				g.drainIfTerminal(&state)
+				cmd.resp <- struct{}{}
+
+			case nextCmd[T]:
+				if len(state.results) > 0 {
+					res := state.results[0]
+					state.results = state.results[1:]
+					cmd.resp <- nextReply[T]{res: res, ok: true}
+					continue
+				}
+				if state.closed && state.inflight == 0 {
+					cmd.resp <- nextReply[T]{ok: false}
+					continue
+				}
+				state.nextWaiters = append(state.nextWaiters, cmd.resp)
+
+			case cancelNextCmd[T]:
+				idx := indexOfWaiter(state.nextWaiters, cmd.resp)
+				if idx == -1 {
+					continue
+				}
+				state.nextWaiters = removeWaiter(state.nextWaiters, idx)
+				cmd.resp <- nextReply[T]{ok: false, err: cmd.err}
+
+			case firstErrCmd:
+				cmd.resp <- state.firstErr
 			}
-			g.finish(Result[T]{Value: value, Err: err})
-		}()
-	} else {
-		defer func() {
-			g.finish(Result[T]{Value: value, Err: err})
-		}()
-	}
 
-	value, err = fn(g.ctx)
-}
+		case evt := <-g.evtCh:
+			if state.firstErr == nil && evt.res.Err != nil {
+				state.firstErr = evt.res.Err
+			}
+			if state.inflight > 0 {
+				state.inflight--
+			}
 
-func (g *Group[T]) acquire() bool {
-	if g.sem == nil {
-		return true
-	}
-
-	select {
-	case g.sem <- struct{}{}:
-		return true
-	case <-g.ctx.Done():
-		return false
+			if len(state.nextWaiters) > 0 {
+				waiter := state.nextWaiters[0]
+				state.nextWaiters = state.nextWaiters[1:]
+				waiter <- nextReply[T]{res: evt.res, ok: true}
+			} else {
+				state.results = append(state.results, evt.res)
+			}
+			g.drainIfTerminal(&state)
+		}
 	}
 }
 
-func (g *Group[T]) release() {
-	if g.sem == nil {
+func (g *Group[T]) drainIfTerminal(state *managerState[T]) {
+	if !state.closed || state.inflight != 0 || len(state.results) != 0 {
 		return
 	}
-	<-g.sem
+	for _, waiter := range state.nextWaiters {
+		waiter <- nextReply[T]{ok: false}
+	}
+	state.nextWaiters = state.nextWaiters[:0]
 }
 
-func (g *Group[T]) finish(res Result[T]) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if res.Err != nil {
-		if g.firstErr == nil {
-			g.firstErr = res.Err
-		}
-		if g.cfg.failFast {
-			g.cancelOnce.Do(func() {
-				g.cancel(res.Err)
-			})
+func indexOfWaiter[T any](waiters []chan nextReply[T], target chan nextReply[T]) int {
+	for i, waiter := range waiters {
+		if waiter == target {
+			return i
 		}
 	}
+	return -1
+}
 
-	g.queue = append(g.queue, res)
-	g.pending--
-	g.cond.Broadcast()
+func removeWaiter[T any](waiters []chan nextReply[T], idx int) []chan nextReply[T] {
+	copy(waiters[idx:], waiters[idx+1:])
+	waiters[len(waiters)-1] = nil
+	return waiters[:len(waiters)-1]
 }

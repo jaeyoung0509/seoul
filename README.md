@@ -1,10 +1,10 @@
 # seoul
 
-`seoul` is a tiny Go concurrency helper inspired by Tokio-style `JoinSet` usage:
+`seoul` is a small Go concurrency helper inspired by Tokio-style `JoinSet` ergonomics.
 
-- start many tasks
-- consume results in completion order (`Next`)
-- keep simple fail-fast cancellation (`WithFailFast(true)`)
+It is built as:
+- `errgroup` for task execution/cancellation/limit
+- an internal actor-style manager loop for result ordering and state consistency
 
 ## Install
 
@@ -12,7 +12,7 @@
 go get github.com/jaeyoung0509/seoul
 ```
 
-## Quick start
+## Quick Start
 
 ```go
 package main
@@ -26,18 +26,29 @@ import (
 )
 
 func main() {
-	g := seoul.New[int](context.Background(), seoul.WithMaxConcurrency(4))
+	g := seoul.New[int](
+		context.Background(),
+		seoul.WithMaxConcurrency(4),
+	)
 
 	for i := 0; i < 3; i++ {
 		i := i
-		g.Go(func(ctx context.Context) (int, error) {
-			time.Sleep(time.Duration(3-i) * 50 * time.Millisecond)
+		if err := g.Go(func(context.Context) (int, error) {
+			time.Sleep(time.Duration(3-i) * 30 * time.Millisecond)
 			return i, nil
-		})
+		}); err != nil {
+			panic(err)
+		}
 	}
 
+	// Required for terminal drain (`ok=false, err=nil`).
+	g.Close()
+
 	for {
-		res, ok := g.Next()
+		res, ok, err := g.Next(context.Background())
+		if err != nil {
+			panic(err)
+		}
 		if !ok {
 			break
 		}
@@ -50,24 +61,69 @@ func main() {
 }
 ```
 
+## Example: fail-fast off
+
+```go
+errBoom := errors.New("boom")
+g := seoul.New[int](context.Background(), seoul.WithFailFast(false))
+
+_ = g.Go(func(context.Context) (int, error) { return 0, errBoom })
+_ = g.Go(func(context.Context) (int, error) { return 42, nil })
+g.Close()
+
+var success, fail int
+for {
+	res, ok, err := g.Next(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	if !ok {
+		break
+	}
+	if res.Err != nil {
+		fail++
+	} else {
+		success++
+	}
+}
+```
+
 ## API
 
 - `New[T any](ctx context.Context, opts ...Option) *Group[T]`
-- `(*Group[T]).Go(fn TaskFunc[T])`
-- `(*Group[T]).Next() (Result[T], bool)`
+- `(*Group[T]).Go(fn TaskFunc[T]) error`
+- `(*Group[T]).Close()`
+- `(*Group[T]).Next(ctx context.Context) (Result[T], bool, error)`
 - `(*Group[T]).Wait() error`
 - `(*Group[T]).Cancel(err error)`
 
-## Notes
+## Semantics
 
-- `Next` blocks until a task finishes.
-- `Next` returns `ok=false` when there are no queued results and no running tasks.
-- `Wait` returns the first observed task error (if any), otherwise context cancellation cause.
+- `Next(ctx)` returns one completion in completion order.
+- `Next(ctx)` returns `ok=false, err=nil` only when `Close()` was called and results are fully drained.
+- `Next(ctx)` returns `ok=false, err=context.*` when caller context ends while waiting.
+- `WithFailFast(true)` cancels group context on first task error.
+- `WithFailFast(false)` keeps remaining tasks running and still reports errors via results and `Wait`.
+- `WithPanicToError(true)` (default) converts panic to task error.
+- `WithPanicToError(false)` rethrows panic (debug-first behavior).
+- `Wait()` returns first observed task error, else context cause, else `nil`.
+
+## Testing
+
+```bash
+go test ./...
+go test -race ./...
+```
+
+- Use timeout-bounded contexts in `Next(ctx)` tests to avoid hangs.
+- Prefer channel synchronization over long `sleep` values to reduce flakiness.
+- For panic rethrow behavior, assert in a subprocess test helper.
+
+## Benchmarks
+
+- Command: `go test -run '^$' -bench . -benchmem ./...`
+- Latest numbers and interpretation: [`docs/benchmarks.md`](docs/benchmarks.md)
 
 ## Status
 
-MVP in progress. Planned next:
-
-- richer error policy (collect all errors)
-- explicit close/seal semantics
-- examples and benchmarks vs plain `errgroup`
+MVP. Current focus is reducing overhead while preserving actor-runtime semantics.
