@@ -119,6 +119,11 @@ go test -race ./...
 - Prefer channel synchronization over long `sleep` values to reduce flakiness.
 - For panic rethrow behavior, assert in a subprocess test helper.
 
+## Benchmarks
+
+- Command: `go test -run '^$' -bench . -benchmem ./...`
+- Latest numbers and interpretation: [`docs/benchmarks.md`](docs/benchmarks.md)
+
 ## Status
 
-MVP. Next focus is benchmark comparison against plain `errgroup+channel`.
+MVP. Current focus is reducing overhead while preserving actor-runtime semantics.
