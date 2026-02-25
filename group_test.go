@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -345,6 +346,157 @@ func TestNextReturnsFalseOnlyAfterCloseAndDrain(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("expected ok=false after close+drain")
+	}
+}
+
+func TestCloseDrainsAllPendingNextWaiters(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background())
+	const waiters = 8
+
+	type nextOutcome struct {
+		ok  bool
+		err error
+	}
+
+	outcomes := make(chan nextOutcome, waiters)
+	var wg sync.WaitGroup
+	wg.Add(waiters)
+
+	for i := 0; i < waiters; i++ {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, ok, err := g.Next(ctx)
+			outcomes <- nextOutcome{ok: ok, err: err}
+		}()
+	}
+
+	g.Close()
+	wg.Wait()
+	close(outcomes)
+
+	for out := range outcomes {
+		if out.err != nil {
+			t.Fatalf("expected waiter err=nil after close+drain, got %v", out.err)
+		}
+		if out.ok {
+			t.Fatal("expected waiter ok=false after close+drain")
+		}
+	}
+}
+
+func TestCanceledWaiterDoesNotConsumeFutureResult(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background(), WithFailFast(false))
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer waitCancel()
+	_, ok, err := g.Next(waitCtx)
+	if ok {
+		t.Fatal("expected ok=false on canceled waiter")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded from canceled waiter, got %v", err)
+	}
+
+	mustGo(t, g, func(context.Context) (int, error) {
+		return 9, nil
+	})
+	g.Close()
+
+	res := mustNext(t, g)
+	if res.Err != nil || res.Value != 9 {
+		t.Fatalf("expected value=9, err=nil, got value=%d err=%v", res.Value, res.Err)
+	}
+
+	_, ok, err = g.Next(context.Background())
+	if err != nil {
+		t.Fatalf("expected err=nil after close+drain, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false after close+drain")
+	}
+}
+
+func TestConcurrentNextConsumersObserveAllResults(t *testing.T) {
+	t.Parallel()
+
+	const (
+		taskCount     = 200
+		consumerCount = 6
+	)
+
+	g := New[int](
+		context.Background(),
+		WithFailFast(false),
+		WithMaxConcurrency(16),
+	)
+
+	for i := 0; i < taskCount; i++ {
+		i := i
+		mustGo(t, g, func(context.Context) (int, error) {
+			if i%7 == 0 {
+				time.Sleep(2 * time.Millisecond)
+			}
+			return i, nil
+		})
+	}
+	g.Close()
+
+	results := make(chan Result[int], taskCount)
+	errs := make(chan error, consumerCount)
+	var wg sync.WaitGroup
+	wg.Add(consumerCount)
+
+	for i := 0; i < consumerCount; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				res, ok, err := g.Next(ctx)
+				cancel()
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !ok {
+					return
+				}
+				results <- res
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("unexpected next error from consumer: %v", err)
+		}
+	}
+
+	seen := make(map[int]struct{}, taskCount)
+	for res := range results {
+		if res.Err != nil {
+			t.Fatalf("unexpected task error: %v", res.Err)
+		}
+		if _, dup := seen[res.Value]; dup {
+			t.Fatalf("duplicate result value observed: %d", res.Value)
+		}
+		seen[res.Value] = struct{}{}
+	}
+	if len(seen) != taskCount {
+		t.Fatalf("expected %d unique results, got %d", taskCount, len(seen))
+	}
+
+	if err := g.Wait(); err != nil {
+		t.Fatalf("expected wait error=nil, got %v", err)
 	}
 }
 
