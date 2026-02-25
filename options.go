@@ -36,7 +36,8 @@ func WithMaxConcurrency(limit int) Option {
 	}
 }
 
-// WithPanicToError converts task panics to errors.
+// WithPanicToError controls panic handling at task boundaries.
+// true converts panic to task error; false rethrows panic.
 func WithPanicToError(enabled bool) Option {
 	return func(c *config) {
 		c.panicToError = enabled

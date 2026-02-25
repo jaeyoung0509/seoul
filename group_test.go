@@ -1,8 +1,11 @@
 package seoul
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -153,17 +156,65 @@ func TestGroupPanicToError(t *testing.T) {
 	mustGo(t, g, func(context.Context) (int, error) {
 		panic("kaboom")
 	})
+	mustGo(t, g, func(context.Context) (int, error) {
+		return 7, nil
+	})
+	g.Close()
 
-	res := mustNext(t, g)
-	if res.Err == nil {
-		t.Fatal("expected panic to be converted to error")
+	r1 := mustNext(t, g)
+	r2 := mustNext(t, g)
+	results := []Result[int]{r1, r2}
+
+	panicSeen := false
+	successSeen := false
+	for _, res := range results {
+		if res.Err != nil && strings.Contains(res.Err.Error(), "panic recovered: kaboom") {
+			panicSeen = true
+		}
+		if res.Err == nil && res.Value == 7 {
+			successSeen = true
+		}
 	}
-	if !strings.Contains(res.Err.Error(), "panic recovered: kaboom") {
-		t.Fatalf("unexpected panic error: %v", res.Err)
+	if !panicSeen {
+		t.Fatalf("expected panic-converted error in results, got %+v", results)
+	}
+	if !successSeen {
+		t.Fatalf("expected successful result after panic, got %+v", results)
+	}
+
+	_, ok, err := g.Next(context.Background())
+	if err != nil {
+		t.Fatalf("expected err=nil after close+drain, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected closed+drained group")
 	}
 
 	if err := g.Wait(); err == nil || !strings.Contains(err.Error(), "panic recovered: kaboom") {
 		t.Fatalf("expected panic error from wait, got %v", err)
+	}
+}
+
+func TestGroupPanicToErrorDisabledRepanics(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv("SEOUL_PANIC_REPANIC_HELPER") == "1" {
+		g := New[int](context.Background(), WithPanicToError(false))
+		_ = g.Go(func(context.Context) (int, error) {
+			panic("kaboom-repanic")
+		})
+		time.Sleep(100 * time.Millisecond)
+		t.Fatal("expected process panic before test returns")
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestGroupPanicToErrorDisabledRepanics")
+	cmd.Env = append(os.Environ(), "SEOUL_PANIC_REPANIC_HELPER=1")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected helper process to fail from panic, output=%s", string(output))
+	}
+	if !bytes.Contains(output, []byte("kaboom-repanic")) {
+		t.Fatalf("expected panic payload in output, got %s", string(output))
 	}
 }
 

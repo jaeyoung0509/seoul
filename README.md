@@ -70,6 +70,8 @@ func main() {
 - `Next(ctx)` returns `ok=false, err=nil` only when group is closed and drained.
 - `WithFailFast(true)` cancels group context on first task error.
 - `WithFailFast(false)` keeps remaining tasks running and reports errors through results/`Wait`.
+- `WithPanicToError(true)` (default) converts panic to task error and keeps runtime contracts.
+- `WithPanicToError(false)` is debug-first: panic is rethrown and can terminate the process.
 - `Wait` returns the first observed task error (if any), otherwise context cancellation cause.
 
 ## Status
