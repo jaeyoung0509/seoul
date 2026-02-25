@@ -74,6 +74,17 @@ func main() {
 - `WithPanicToError(false)` is debug-first: panic is rethrown and can terminate the process.
 - `Wait` returns the first observed task error (if any), otherwise context cancellation cause.
 
+## Testing
+
+```bash
+go test ./...
+go test -race ./...
+```
+
+- Use timeout-bounded contexts in `Next(ctx)` tests to avoid hangs.
+- Prefer channel synchronization over long `sleep` values to reduce flakiness.
+- For panic rethrow behavior, assert in a subprocess test helper.
+
 ## Status
 
 MVP in progress. Planned next:
