@@ -26,6 +26,45 @@ var (
 	ErrNilTask = errors.New("seoul: nil task")
 )
 
+type nextReply[T any] struct {
+	res Result[T]
+	ok  bool
+	err error
+}
+
+type taskDoneEvent[T any] struct {
+	res Result[T]
+}
+
+type submitCmd[T any] struct {
+	resp chan error
+}
+
+type closeCmd struct {
+	resp chan struct{}
+}
+
+type nextCmd[T any] struct {
+	resp chan nextReply[T]
+}
+
+type cancelNextCmd[T any] struct {
+	resp chan nextReply[T]
+	err  error
+}
+
+type firstErrCmd struct {
+	resp chan error
+}
+
+type managerState[T any] struct {
+	closed      bool
+	inflight    int
+	results     []Result[T]
+	nextWaiters []chan nextReply[T]
+	firstErr    error
+}
+
 // Group runs tasks and streams completed results with Next.
 type Group[T any] struct {
 	ctx     context.Context
@@ -34,12 +73,8 @@ type Group[T any] struct {
 	eg      *errgroup.Group
 	cfg     config
 
-	mu       sync.Mutex
-	closed   bool
-	pending  int
-	queue    []Result[T]
-	firstErr error
-	notify   chan struct{}
+	cmdCh chan any
+	evtCh chan taskDoneEvent[T]
 
 	cancelOnce sync.Once
 }
@@ -70,9 +105,11 @@ func New[T any](ctx context.Context, opts ...Option) *Group[T] {
 		cancel:  cancel,
 		eg:      eg,
 		cfg:     cfg,
-		queue:   make([]Result[T], 0, cfg.resultBuffer),
-		notify:  make(chan struct{}),
+		cmdCh:   make(chan any),
+		evtCh:   make(chan taskDoneEvent[T]),
 	}
+	go g.runManager()
+
 	return g
 }
 
@@ -93,12 +130,9 @@ func (g *Group[T]) Cancel(err error) {
 
 // Close seals the group and prevents future Go calls.
 func (g *Group[T]) Close() {
-	g.mu.Lock()
-	if !g.closed {
-		g.closed = true
-		g.signalLocked()
-	}
-	g.mu.Unlock()
+	resp := make(chan struct{}, 1)
+	g.cmdCh <- closeCmd{resp: resp}
+	<-resp
 }
 
 // Go starts a task.
@@ -107,14 +141,11 @@ func (g *Group[T]) Go(fn TaskFunc[T]) error {
 		return ErrNilTask
 	}
 
-	g.mu.Lock()
-	if g.closed {
-		g.mu.Unlock()
-		return ErrGroupClosed
+	resp := make(chan error, 1)
+	g.cmdCh <- submitCmd[T]{resp: resp}
+	if err := <-resp; err != nil {
+		return err
 	}
-	g.pending++
-	g.signalLocked()
-	g.mu.Unlock()
 
 	g.eg.Go(func() (retErr error) {
 		var (
@@ -123,9 +154,12 @@ func (g *Group[T]) Go(fn TaskFunc[T]) error {
 		)
 
 		defer func() {
-			g.finish(Result[T]{Value: value, Err: taskErr})
+			g.evtCh <- taskDoneEvent[T]{res: Result[T]{Value: value, Err: taskErr}}
 
 			if taskErr != nil && g.cfg.failFast {
+				g.cancelOnce.Do(func() {
+					g.cancel(taskErr)
+				})
 				retErr = taskErr
 			}
 		}()
@@ -151,36 +185,30 @@ func (g *Group[T]) Next(ctx context.Context) (res Result[T], ok bool, err error)
 		ctx = context.Background()
 	}
 
-	for {
-		g.mu.Lock()
-		if len(g.queue) > 0 {
-			res = g.queue[0]
-			g.queue = g.queue[1:]
-			g.mu.Unlock()
-			return res, true, nil
-		}
-		if g.closed && g.pending == 0 {
-			g.mu.Unlock()
-			return Result[T]{}, false, nil
-		}
-		notify := g.notify
-		g.mu.Unlock()
+	resp := make(chan nextReply[T], 1)
+	g.cmdCh <- nextCmd[T]{resp: resp}
 
-		select {
-		case <-ctx.Done():
-			return Result[T]{}, false, ctx.Err()
-		case <-notify:
-		}
+	stopCancelWatcher := make(chan struct{})
+	if done := ctx.Done(); done != nil {
+		go func() {
+			select {
+			case <-done:
+				g.cmdCh <- cancelNextCmd[T]{resp: resp, err: ctx.Err()}
+			case <-stopCancelWatcher:
+			}
+		}()
 	}
+
+	reply := <-resp
+	close(stopCancelWatcher)
+	return reply.res, reply.ok, reply.err
 }
 
 // Wait waits for all currently started tasks and returns the first observed error.
 func (g *Group[T]) Wait() error {
 	waitErr := g.eg.Wait()
+	firstErr := g.getFirstErr()
 
-	g.mu.Lock()
-	firstErr := g.firstErr
-	g.mu.Unlock()
 	if firstErr != nil {
 		return firstErr
 	}
@@ -190,28 +218,101 @@ func (g *Group[T]) Wait() error {
 	return context.Cause(g.baseCtx)
 }
 
-func (g *Group[T]) finish(res Result[T]) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if res.Err != nil {
-		if g.firstErr == nil {
-			g.firstErr = res.Err
-		}
-		if g.cfg.failFast {
-			g.cancelOnce.Do(func() {
-				g.cancel(res.Err)
-			})
-		}
-	}
-
-	g.queue = append(g.queue, res)
-	g.pending--
-	g.signalLocked()
+func (g *Group[T]) getFirstErr() error {
+	resp := make(chan error, 1)
+	g.cmdCh <- firstErrCmd{resp: resp}
+	return <-resp
 }
 
-func (g *Group[T]) signalLocked() {
-	ch := g.notify
-	g.notify = make(chan struct{})
-	close(ch)
+func (g *Group[T]) runManager() {
+	state := managerState[T]{
+		results:     make([]Result[T], 0, g.cfg.resultBuffer),
+		nextWaiters: make([]chan nextReply[T], 0),
+	}
+
+	for {
+		select {
+		case raw := <-g.cmdCh:
+			switch cmd := raw.(type) {
+			case submitCmd[T]:
+				if state.closed {
+					cmd.resp <- ErrGroupClosed
+					continue
+				}
+				state.inflight++
+				cmd.resp <- nil
+
+			case closeCmd:
+				state.closed = true
+				g.drainIfTerminal(&state)
+				cmd.resp <- struct{}{}
+
+			case nextCmd[T]:
+				if len(state.results) > 0 {
+					res := state.results[0]
+					state.results = state.results[1:]
+					cmd.resp <- nextReply[T]{res: res, ok: true}
+					continue
+				}
+				if state.closed && state.inflight == 0 {
+					cmd.resp <- nextReply[T]{ok: false}
+					continue
+				}
+				state.nextWaiters = append(state.nextWaiters, cmd.resp)
+
+			case cancelNextCmd[T]:
+				idx := indexOfWaiter(state.nextWaiters, cmd.resp)
+				if idx == -1 {
+					continue
+				}
+				state.nextWaiters = removeWaiter(state.nextWaiters, idx)
+				cmd.resp <- nextReply[T]{ok: false, err: cmd.err}
+
+			case firstErrCmd:
+				cmd.resp <- state.firstErr
+			}
+
+		case evt := <-g.evtCh:
+			if state.firstErr == nil && evt.res.Err != nil {
+				state.firstErr = evt.res.Err
+			}
+			if state.inflight > 0 {
+				state.inflight--
+			}
+
+			if len(state.nextWaiters) > 0 {
+				waiter := state.nextWaiters[0]
+				state.nextWaiters = state.nextWaiters[1:]
+				waiter <- nextReply[T]{res: evt.res, ok: true}
+			} else {
+				state.results = append(state.results, evt.res)
+			}
+			g.drainIfTerminal(&state)
+		}
+	}
+}
+
+func (g *Group[T]) drainIfTerminal(state *managerState[T]) {
+	if !state.closed || state.inflight != 0 || len(state.results) != 0 {
+		return
+	}
+	for _, waiter := range state.nextWaiters {
+		waiter <- nextReply[T]{ok: false}
+	}
+	state.nextWaiters = state.nextWaiters[:0]
+}
+
+func indexOfWaiter[T any](waiters []chan nextReply[T], target chan nextReply[T]) int {
+	for i, waiter := range waiters {
+		if waiter == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func removeWaiter[T any](waiters []chan nextReply[T], idx int) []chan nextReply[T] {
+	copy(waiters[idx:], waiters[idx+1:])
+	waiters[len(waiters)-1] = nil
+	return waiters[:len(waiters)-1]
 }

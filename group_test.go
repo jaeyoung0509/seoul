@@ -96,6 +96,55 @@ func TestGroupFailFastCancelsRemainingTasks(t *testing.T) {
 	}
 }
 
+func TestGroupFailFastDisabledKeepsRunningTasks(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background(), WithFailFast(false))
+	errBoom := errors.New("boom")
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	mustGo(t, g, func(context.Context) (int, error) {
+		return 0, errBoom
+	})
+	mustGo(t, g, func(ctx context.Context) (int, error) {
+		close(started)
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-release:
+			return 42, nil
+		}
+	})
+
+	<-started
+	close(release)
+	g.Close()
+
+	r1 := mustNext(t, g)
+	r2 := mustNext(t, g)
+	results := []Result[int]{r1, r2}
+
+	if !containsError([]error{r1.Err, r2.Err}, errBoom) {
+		t.Fatalf("expected boom in results, got %+v", results)
+	}
+	if !containsResult(results, 42, nil) {
+		t.Fatalf("expected successful result value=42, got %+v", results)
+	}
+
+	_, ok, err := g.Next(context.Background())
+	if err != nil {
+		t.Fatalf("expected err=nil, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected closed+drained group")
+	}
+
+	if err := g.Wait(); !errors.Is(err, errBoom) {
+		t.Fatalf("expected wait error=boom, got %v", err)
+	}
+}
+
 func TestGroupPanicToError(t *testing.T) {
 	t.Parallel()
 
@@ -271,6 +320,15 @@ func mustGo[T any](t *testing.T, g *Group[T], fn TaskFunc[T]) {
 func containsError(errs []error, target error) bool {
 	for _, err := range errs {
 		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsResult[T comparable](results []Result[T], value T, err error) bool {
+	for _, res := range results {
+		if res.Value == value && errors.Is(res.Err, err) {
 			return true
 		}
 	}
