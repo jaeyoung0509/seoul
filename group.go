@@ -18,6 +18,18 @@ type Result[T any] struct {
 	Err   error
 }
 
+// Stream is a channel-based adapter over Next.
+//
+// C carries task results in completion order.
+// Done carries exactly one final error and then closes.
+//
+// Result.Err is task-level error.
+// Done error is stream/group final error.
+type Stream[T any] struct {
+	C    <-chan Result[T]
+	Done <-chan error
+}
+
 var (
 	// ErrGroupClosed is returned by Go when submission happens after Close.
 	ErrGroupClosed = errors.New("seoul: group is closed")
@@ -202,6 +214,61 @@ func (g *Group[T]) Next(ctx context.Context) (res Result[T], ok bool, err error)
 	reply := <-resp
 	close(stopCancelWatcher)
 	return reply.res, reply.ok, reply.err
+}
+
+// Stream adapts Next(ctx) into a range-friendly stream.
+//
+// Stream termination behavior:
+//   - task-level failures are reported in Result.Err through Stream.C
+//   - if ctx ends while waiting/sending, Stream.C closes and Done returns ctx error
+//   - otherwise Done returns the same final error semantics as Wait
+func (g *Group[T]) Stream(ctx context.Context) *Stream[T] {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	out := make(chan Result[T])
+	done := make(chan error, 1)
+	s := &Stream[T]{
+		C:    out,
+		Done: done,
+	}
+
+	go func() {
+		defer close(out)
+
+		var streamErr error
+
+	loop:
+		for {
+			res, ok, err := g.Next(ctx)
+			if err != nil {
+				streamErr = err
+				g.Cancel(err)
+				break
+			}
+			if !ok {
+				break
+			}
+
+			select {
+			case out <- res:
+			case <-ctx.Done():
+				streamErr = ctx.Err()
+				g.Cancel(streamErr)
+				break loop
+			}
+		}
+
+		finalErr := g.Wait()
+		if finalErr == nil {
+			finalErr = streamErr
+		}
+		done <- finalErr
+		close(done)
+	}()
+
+	return s
 }
 
 // Wait waits for all currently started tasks and returns the first observed error.

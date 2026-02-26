@@ -500,6 +500,107 @@ func TestConcurrentNextConsumersObserveAllResults(t *testing.T) {
 	}
 }
 
+func TestStreamReturnsCompletionOrderAndDoneNil(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background(), WithFailFast(false))
+
+	first := make(chan struct{})
+	second := make(chan struct{})
+	secondDone := make(chan struct{})
+
+	mustGo(t, g, func(context.Context) (int, error) {
+		<-first
+		<-secondDone
+		return 1, nil
+	})
+	mustGo(t, g, func(context.Context) (int, error) {
+		<-second
+		close(secondDone)
+		return 2, nil
+	})
+	g.Close()
+
+	s := g.Stream(withTimeout(t, 2*time.Second))
+
+	close(first)
+	close(second)
+
+	var got []Result[int]
+	for res := range s.C {
+		got = append(got, res)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(got))
+	}
+	if got[0].Value != 2 || got[0].Err != nil {
+		t.Fatalf("expected first result value=2 err=nil, got value=%d err=%v", got[0].Value, got[0].Err)
+	}
+	if got[1].Value != 1 || got[1].Err != nil {
+		t.Fatalf("expected second result value=1 err=nil, got value=%d err=%v", got[1].Value, got[1].Err)
+	}
+
+	if err := <-s.Done; err != nil {
+		t.Fatalf("expected stream done error=nil, got %v", err)
+	}
+}
+
+func TestStreamFailFastDisabledReportsTaskErrorsInResults(t *testing.T) {
+	t.Parallel()
+
+	errBoom := errors.New("boom")
+	g := New[int](context.Background(), WithFailFast(false))
+
+	mustGo(t, g, func(context.Context) (int, error) {
+		return 0, errBoom
+	})
+	mustGo(t, g, func(context.Context) (int, error) {
+		return 42, nil
+	})
+	g.Close()
+
+	s := g.Stream(withTimeout(t, 2*time.Second))
+
+	var success, fail int
+	for res := range s.C {
+		if res.Err != nil {
+			fail++
+			continue
+		}
+		if res.Value == 42 {
+			success++
+		}
+	}
+
+	if success != 1 || fail != 1 {
+		t.Fatalf("expected success=1 fail=1, got success=%d fail=%d", success, fail)
+	}
+
+	if err := <-s.Done; !errors.Is(err, errBoom) {
+		t.Fatalf("expected stream done error=boom, got %v", err)
+	}
+}
+
+func TestStreamReturnsContextErrorOnCancellation(t *testing.T) {
+	t.Parallel()
+
+	g := New[int](context.Background(), WithFailFast(false))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	s := g.Stream(ctx)
+
+	for range s.C {
+		t.Fatal("did not expect result before cancellation")
+	}
+
+	if err := <-s.Done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected stream done deadline exceeded, got %v", err)
+	}
+}
+
 func mustNext[T any](t *testing.T, g *Group[T]) Result[T] {
 	t.Helper()
 

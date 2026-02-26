@@ -7,6 +7,7 @@
 // Core behavior:
 //   - submit tasks with Go
 //   - consume completions in completion order via Next(ctx)
+//   - consume completions via range-friendly Stream(ctx)
 //   - stop new submissions with Close
 //   - wait for completion with Wait
 //
@@ -14,6 +15,8 @@
 //   - Next(ctx) returns (res, true, nil) for one completed task
 //   - Next(ctx) returns (zero, false, nil) only after Close and full drain
 //   - Next(ctx) returns (zero, false, ctx.Err()) if caller context ends
+//   - Stream(ctx).C yields Result values in completion order
+//   - Stream(ctx).Done yields one final error and then closes
 //   - Wait returns the first observed task error, then context cause, then nil
 //
 // Policy options:
