@@ -65,7 +65,7 @@ type managerState[T any] struct {
 	firstErr    error
 }
 
-// Group runs tasks and streams completed results with Next.
+// Group runs tasks and exposes completed results with Next/Results.
 type Group[T any] struct {
 	ctx     context.Context
 	baseCtx context.Context
@@ -202,6 +202,39 @@ func (g *Group[T]) Next(ctx context.Context) (res Result[T], ok bool, err error)
 	reply := <-resp
 	close(stopCancelWatcher)
 	return reply.res, reply.ok, reply.err
+}
+
+// Results adapts Next(ctx) into a range-friendly results channel.
+//
+// Results observes task completion in the same completion order as Next.
+// The returned channel closes when:
+//   - Next(ctx) returns ok=false (group closed and drained), or
+//   - Next(ctx) returns err!=nil (typically caller context ended).
+//
+// Results never calls Close, Cancel, or Wait. Group lifecycle remains owner-managed.
+func (g *Group[T]) Results(ctx context.Context) <-chan Result[T] {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	out := make(chan Result[T], 1)
+	go func() {
+		defer close(out)
+		for {
+			res, ok, err := g.Next(ctx)
+			if err != nil || !ok {
+				return
+			}
+
+			select {
+			case out <- res:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out
 }
 
 // Wait waits for all currently started tasks and returns the first observed error.
