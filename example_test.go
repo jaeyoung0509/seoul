@@ -46,8 +46,8 @@ func ExampleGroup_next() {
 	// true
 }
 
-func ExampleGroup_stream() {
-	// Stream is a range-friendly adapter over Next.
+func ExampleGroup_results() {
+	// Results is a range-friendly adapter over Next.
 	g := seoul.New[int](context.Background(), seoul.WithFailFast(false))
 
 	first := make(chan struct{})
@@ -66,40 +66,57 @@ func ExampleGroup_stream() {
 	})
 	g.Close()
 
-	s := g.Stream(context.Background())
-
 	// Force completion order: second then first.
 	close(first)
 	close(second)
 
-	for res := range s.C {
+	for res := range g.Results(context.Background()) {
 		fmt.Println(res.Value, res.Err == nil)
 	}
 
-	// Done carries one final stream/group error.
-	fmt.Println(<-s.Done == nil)
+	// Final status remains owner-managed via Wait.
+	fmt.Println(g.Wait() == nil)
 	// Output:
 	// 2 true
 	// 1 true
 	// true
 }
 
-func ExampleGroup_stream_contextCancel() {
-	g := seoul.New[int](context.Background())
+func ExampleGroup_results_contextCancel() {
+	g := seoul.New[int](context.Background(), seoul.WithFailFast(false))
+	release := make(chan struct{})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	_ = g.Go(func(ctx context.Context) (int, error) {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-release:
+			return 7, nil
+		}
+	})
+
+	streamCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	s := g.Stream(ctx)
-
 	count := 0
-	for range s.C {
+	for range g.Results(streamCtx) {
 		count++
 	}
 
 	fmt.Println(count)
-	fmt.Println(errors.Is(<-s.Done, context.DeadlineExceeded))
+	fmt.Println(errors.Is(streamCtx.Err(), context.DeadlineExceeded))
+	fmt.Println(g.Context().Err() == nil)
+
+	// Owner decides when to continue/close/cancel the group.
+	close(release)
+	g.Close()
+	for range g.Results(context.Background()) {
+	}
+	fmt.Println(g.Wait() == nil)
+
 	// Output:
 	// 0
+	// true
+	// true
 	// true
 }

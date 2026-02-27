@@ -94,7 +94,7 @@ for {
 - `(*Group[T]).Go(fn TaskFunc[T]) error`
 - `(*Group[T]).Close()`
 - `(*Group[T]).Next(ctx context.Context) (Result[T], bool, error)`
-- `(*Group[T]).Stream(ctx context.Context) *Stream[T]`
+- `(*Group[T]).Results(ctx context.Context) <-chan Result[T]`
 - `(*Group[T]).Wait() error`
 - `(*Group[T]).Cancel(err error)`
 
@@ -103,25 +103,23 @@ for {
 - `Next(ctx)` returns one completion in completion order.
 - `Next(ctx)` returns `ok=false, err=nil` only when `Close()` was called and results are fully drained.
 - `Next(ctx)` returns `ok=false, err=context.*` when caller context ends while waiting.
-- `Stream(ctx).C` yields the same completion-order results as repeated `Next(ctx)`.
-- `Stream(ctx).Done` yields one final error and closes (`Result.Err` remains task-level error).
+- `Results(ctx)` yields the same completion-order results as repeated `Next(ctx)`.
+- `Results(ctx)` only controls the consumer side; it does not cancel or close the group.
 - `WithFailFast(true)` cancels group context on first task error.
 - `WithFailFast(false)` keeps remaining tasks running and still reports errors via results and `Wait`.
 - `WithPanicToError(true)` (default) converts panic to task error.
 - `WithPanicToError(false)` rethrows panic (debug-first behavior).
 - `Wait()` returns first observed task error, else context cause, else `nil`.
 
-## Stream Usage
+## Results Usage
 
 ```go
-s := g.Stream(context.Background())
-
-for res := range s.C {
+for res := range g.Results(context.Background()) {
 	// res.Err is task-level error
 }
 
-if err := <-s.Done; err != nil {
-	// stream/group final error
+if err := g.Wait(); err != nil {
+	// group final error
 }
 ```
 

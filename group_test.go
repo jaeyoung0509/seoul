@@ -500,7 +500,7 @@ func TestConcurrentNextConsumersObserveAllResults(t *testing.T) {
 	}
 }
 
-func TestStreamReturnsCompletionOrderAndDoneNil(t *testing.T) {
+func TestResultsReturnsCompletionOrder(t *testing.T) {
 	t.Parallel()
 
 	g := New[int](context.Background(), WithFailFast(false))
@@ -521,13 +521,13 @@ func TestStreamReturnsCompletionOrderAndDoneNil(t *testing.T) {
 	})
 	g.Close()
 
-	s := g.Stream(withTimeout(t, 2*time.Second))
+	results := g.Results(withTimeout(t, 2*time.Second))
 
 	close(first)
 	close(second)
 
 	var got []Result[int]
-	for res := range s.C {
+	for res := range results {
 		got = append(got, res)
 	}
 
@@ -541,12 +541,12 @@ func TestStreamReturnsCompletionOrderAndDoneNil(t *testing.T) {
 		t.Fatalf("expected second result value=1 err=nil, got value=%d err=%v", got[1].Value, got[1].Err)
 	}
 
-	if err := <-s.Done; err != nil {
-		t.Fatalf("expected stream done error=nil, got %v", err)
+	if err := g.Wait(); err != nil {
+		t.Fatalf("expected wait error=nil, got %v", err)
 	}
 }
 
-func TestStreamFailFastDisabledReportsTaskErrorsInResults(t *testing.T) {
+func TestResultsFailFastDisabledReportsTaskErrors(t *testing.T) {
 	t.Parallel()
 
 	errBoom := errors.New("boom")
@@ -560,10 +560,10 @@ func TestStreamFailFastDisabledReportsTaskErrorsInResults(t *testing.T) {
 	})
 	g.Close()
 
-	s := g.Stream(withTimeout(t, 2*time.Second))
+	results := g.Results(withTimeout(t, 2*time.Second))
 
 	var success, fail int
-	for res := range s.C {
+	for res := range results {
 		if res.Err != nil {
 			fail++
 			continue
@@ -577,27 +577,65 @@ func TestStreamFailFastDisabledReportsTaskErrorsInResults(t *testing.T) {
 		t.Fatalf("expected success=1 fail=1, got success=%d fail=%d", success, fail)
 	}
 
-	if err := <-s.Done; !errors.Is(err, errBoom) {
-		t.Fatalf("expected stream done error=boom, got %v", err)
+	if err := g.Wait(); !errors.Is(err, errBoom) {
+		t.Fatalf("expected wait error=boom, got %v", err)
 	}
 }
 
-func TestStreamReturnsContextErrorOnCancellation(t *testing.T) {
+func TestResultsContextCancelDoesNotCancelGroup(t *testing.T) {
 	t.Parallel()
 
 	g := New[int](context.Background(), WithFailFast(false))
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	mustGo(t, g, func(ctx context.Context) (int, error) {
+		close(started)
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-release:
+			return 7, nil
+		}
+	})
+
+	<-started
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 
-	s := g.Stream(ctx)
-
-	for range s.C {
+	for range g.Results(ctx) {
 		t.Fatal("did not expect result before cancellation")
 	}
 
-	if err := <-s.Done; !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected stream done deadline exceeded, got %v", err)
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("expected stream context deadline exceeded, got %v", ctx.Err())
+	}
+
+	select {
+	case <-g.Context().Done():
+		t.Fatal("expected group context to remain active after Results cancellation")
+	default:
+	}
+
+	close(release)
+	g.Close()
+
+	res := mustNext(t, g)
+	if res.Err != nil || res.Value != 7 {
+		t.Fatalf("expected value=7 err=nil after release, got value=%d err=%v", res.Value, res.Err)
+	}
+
+	_, ok, err := g.Next(context.Background())
+	if err != nil {
+		t.Fatalf("expected err=nil after close+drain, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false after close+drain")
+	}
+
+	if err := g.Wait(); err != nil {
+		t.Fatalf("expected wait error=nil, got %v", err)
 	}
 }
 
