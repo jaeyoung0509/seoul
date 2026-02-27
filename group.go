@@ -217,7 +217,7 @@ func (g *Group[T]) Results(ctx context.Context) <-chan Result[T] {
 		ctx = context.Background()
 	}
 
-	out := make(chan Result[T])
+	out := make(chan Result[T], 1)
 	go func() {
 		defer close(out)
 		for {
