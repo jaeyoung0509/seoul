@@ -41,17 +41,10 @@ func main() {
 		}
 	}
 
-	// Required for terminal drain (`ok=false, err=nil`).
+	// Required for terminal drain.
 	g.Close()
 
-	for {
-		res, ok, err := g.Next(context.Background())
-		if err != nil {
-			panic(err)
-		}
-		if !ok {
-			break
-		}
+	for res := range g.Results(context.Background()) {
 		fmt.Println("done:", res.Value, "err:", res.Err)
 	}
 
@@ -86,6 +79,23 @@ for {
 		success++
 	}
 }
+```
+
+## Real-World Example (Public APIs)
+
+For a production-style example, see:
+- [`examples/public-api-snapshot/main.go`](examples/public-api-snapshot/main.go)
+
+What it demonstrates:
+- 4 public APIs fetched concurrently with one group timeout + per-request timeouts
+- critical vs optional sources split (`Wait` for hard failure, warnings for soft failure)
+- completion-order reduction via `Results(ctx)`
+- bounded fan-out via `WithMaxConcurrency(4)`
+
+Run it:
+
+```bash
+go run ./examples/public-api-snapshot
 ```
 
 ## API
